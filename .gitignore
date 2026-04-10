@@ -1,7 +1,6 @@
 # Data and heavy files
 data/
 data.zip
-output/
 *.pth
 *.h5
 
