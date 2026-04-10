@@ -1,0 +1,182 @@
+
+
+--- CELL 27 ---
+# ============================================================
+# K-Fold 앙상블 (Focal Loss 적용)
+# ============================================================
+import torch.nn.functional as F
+
+def train_kfold_ensemble(ModelClass, num_folds=3):
+    models_list = []
+    fold_scores = []
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=CFG.SEED)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df["class_id"])):
+        print(f"\nFold {fold+1}/{num_folds} 학습 시작")
+
+        # 폴드 데이터셋 생성
+        train_subset, val_subset = make_datasets(train_idx, val_idx)
+        train_loader_fold = DataLoader(train_subset, batch_size=CFG.BATCH_SIZE,
+                                       shuffle=True, num_workers=4, pin_memory=True)
+        val_loader_fold   = DataLoader(val_subset,   batch_size=CFG.BATCH_SIZE,
+                                       shuffle=False, num_workers=4, pin_memory=True)
+
+        fold_model = ModelClass(num_classes=CFG.NUM_CLASSES, pretrained=True).to(DEVICE)
+
+        # [핵심] Focal Loss 사용
+        criterion_fold = FocalLoss(
+            gamma=2.0,                        # 집중도 (높을수록 어려운 샘플 집중)
+            label_smoothing=CFG.LABEL_SMOOTHING,
+            num_classes=CFG.NUM_CLASSES
+        )
+
+        optimizer_fold = optim.AdamW(
+            fold_model.parameters(), lr=1e-3, weight_decay=CFG.WEIGHT_DECAY
+        )
+        scheduler_fold = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_fold, T_max=CFG.NUM_EPOCHS, eta_min=1e-6
+        )
+
+        best_state, _, _, fold_f1_scores = train_model(
+            fold_model, train_loader_fold, val_loader_fold,
+            criterion_fold, optimizer_fold, CFG.NUM_EPOCHS, DEVICE, scheduler_fold
+        )
+        fold_model.load_state_dict(best_state)
+        models_list.append(fold_model)
+        fold_scores.append(max(fold_f1_scores))
+        print(f"  Fold {fold+1} 최고 F1: {max(fold_f1_scores):.4f}")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print(f"\nMethod 2 완료. 평균 F1: {np.mean(fold_scores):.4f} ± {np.std(fold_scores):.4f}")
+    return models_list, fold_scores
+
+method2_models, method2_scores = train_kfold_ensemble(ResNet50Model, num_folds=3)
+
+
+--- CELL 28 ---
+import copy
+from tqdm import tqdm
+from sklearn.metrics import f1_score
+import torch.nn.functional as F
+from sklearn.model_selection import StratifiedKFold
+import torch
+
+# Focal Loss를 이용한 k-Fold
+def train_kfold_ensemble(ModelClass, num_folds=3):
+    models_list = []
+    fold_scores = []
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=CFG.SEED)
+
+    # 1. Base Dataset 한 번만 정의 (나중에 Split 시 Transform을 개별적으로 씌우기 위함)
+    base_dataset = PigPostureDataset(
+        train_df,
+        os.path.join(CFG.INPUT_DIR, 'data', 'pig_posture_recognition', "train_images"),
+        transform=None # 초기에는 없음
+    )
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df["class_id"])):
+        print(f"\n{'='*20} Fold {fold+1}/{num_folds} 학습 시작 {'='*20}")
+
+        # 2. [개선 1 적용] Deepcopy를 이용한 Train/Val 분리 및 증강(Transform) 오염 방지
+        train_ds = copy.deepcopy(base_dataset)
+        train_ds.transform = train_transforms
+        
+        val_ds = copy.deepcopy(base_dataset)
+        val_ds.transform = val_transforms
+        
+        # 인덱스에 따라 폴드별 데이터 할당
+        train_subset = torch.utils.data.Subset(train_ds, train_idx)
+        val_subset   = torch.utils.data.Subset(val_ds, val_idx)
+
+        # Windows 노트북에서의 무한 루프(Hang)를 막기 위해 num_workers=0 설정
+        train_loader = DataLoader(
+            train_subset, batch_size=CFG.BATCH_SIZE, shuffle=True, 
+            num_workers=0, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_subset, batch_size=CFG.BATCH_SIZE, shuffle=False, 
+            num_workers=0, pin_memory=True
+        )
+
+        # 3. [개선 2, 3 적용] 모델 초기화 (4채널 Edge Map & 커스텀 분류기 사용 옵션 활성화)
+        model = ModelClass(num_classes=CFG.NUM_CLASSES, use_edge_map=CFG.USE_EDGE_MAP).to(device)
+        
+        # 방금 수정한 FocalLoss 및 Optimizer 설정
+        criterion = FocalLoss(gamma=2.0, label_smoothing=0.1, num_classes=CFG.NUM_CLASSES)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.LEARNING_RATE)
+        
+        best_val_loss = float('inf')
+        best_model_state = None
+
+        # 4. Epoch 단위 학습 진행
+        for epoch in range(CFG.EPOCHS):
+            model.train()
+            train_loss = 0.0
+            
+            # tqdm을 이용한 진행률 표시바 (학습 루프)
+            for images, labels in tqdm(train_loader, desc=f"Fold {fold+1} Epoch {epoch+1} Train", leave=False):
+                images, labels = images.to(device), labels.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+                
+            train_loss /= len(train_loader)
+            
+            # 검증(Validation) 루프
+            model.eval()
+            val_loss = 0.0
+            val_preds = []
+            val_targets = []
+            
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    outputs = model(images)
+                    
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    
+                    preds = torch.argmax(outputs, dim=1)
+                    val_preds.extend(preds.cpu().numpy())
+                    val_targets.extend(labels.cpu().numpy())
+                    
+            val_loss /= len(val_loader)
+            val_f1 = f1_score(val_targets, val_preds, average='macro')
+            
+            print(f"Epoch {epoch+1:02d}/{CFG.EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
+            
+            # 최적의 검증 손실을 보인 모델의 가중치를 기억 (Early Stopping의 핵심 원리)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = copy.deepcopy(model.state_dict())
+                
+        print(f"[*] Fold {fold+1} 최고 성능 (Val Loss): {best_val_loss:.4f}")
+        
+        # 5. 해당 Fold에서 가장 성능이 좋았던 모델 저장
+        model.load_state_dict(best_model_state)
+        models_list.append(model)
+        fold_scores.append(best_val_loss)
+        
+    print("\n[완료] k-Fold 앙상블 학습이 모두 종료되었습니다.")
+    return models_list, fold_scores
+
+
+--- CELL 29 ---
+import torch.nn.functional as F
+# Focal Loss를 이용한 k-Fold
+def train_kfold_ensemble(ModelClass, num_folds=3):
+    models_list = []
+    fold_scores = []
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=CFG.SEED)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df["class_id"])):
+        print(f"\nFold {fold+1}/{num_folds} 학습 시작")
+
+        # 폴드 데이터셋 생성
+        train_fold = torch.utils.data.Subset(train_dataset, train_idx)
